@@ -3,7 +3,6 @@ import streamlit as st
 import re
 from langchain.agents import initialize_agent, Tool, AgentExecutor
 from langchain.agents import AgentType
-# from langchain.llms import OpenAI
 from langchain_ollama import OllamaLLM
 from langchain.tools import DuckDuckGoSearchResults
 from langchain.chains import LLMChain
@@ -37,6 +36,7 @@ def calculate_score(responses, questions):
     score = sum(responses)
     return score
 
+
 # Function to extract symptoms from the session data using LLM
 def extract_symptoms_with_llm(session, symptom_keywords, llm):
     prompt = PromptTemplate(
@@ -45,45 +45,75 @@ def extract_symptoms_with_llm(session, symptom_keywords, llm):
     )
     chain = LLMChain(llm=llm, prompt=prompt)
     response = chain.run(session=session, symptoms=symptom_keywords)
-    # Parse response to extract symptoms and intensity
-    # Placeholder for actual parsing logic
-    return response
+    
+    # Initialize symptom data dictionary
+    symptom_data = {}
+    
+    # Iterate through each symptom keyword
+    for symptom in symptom_keywords:
+        # Check if the symptom is mentioned in the response
+        if symptom.lower() in response.lower():
+            symptom_data[symptom] = {'present': True}
+            # Use regex to find intensity value for the symptom
+            pattern = re.compile(rf"{re.escape(symptom)}.*?(\d+)", re.IGNORECASE)
+            match = pattern.search(response)
+            if match:
+                intensity = int(match.group(1))
+            else:
+                # If no number is found, default intensity to 3
+                intensity = 3
+            symptom_data[symptom]['intensity'] = intensity
+        else:
+            # Symptom not present
+            symptom_data[symptom] = {'present': False, 'intensity': 0}
+    
+    return symptom_data
 
 # Function to analyze symptom progress
 def analyze_symptom_progress(symptoms_data):
     progress_message = ""
     for symptom, details in symptoms_data.items():
-        if details['session1']['present'] and not details['session2']['present']:
+        session1 = details.get('session1', {})
+        session2 = details.get('session2', {})
+        if session1.get('present') and not session2.get('present'):
             progress_message += f"Symptom '{symptom}' was present in Session 1 but not in Session 2. Possible improvement.\n"
-        elif not details['session1']['present'] and details['session2']['present']:
+        elif not session1.get('present') and session2.get('present'):
             progress_message += f"Symptom '{symptom}' was not mentioned in Session 1 but appeared in Session 2. Possible worsening.\n"
-        elif details['session1']['present'] and details['session2']['present']:
-            if details['session2']['intensity'] < details['session1']['intensity']:
-                progress_message += f"Symptom '{symptom}' improved from {details['session1']['intensity']} to {details['session2']['intensity']}.\n"
+        elif session1.get('present') and session2.get('present'):
+            if session2.get('intensity', 0) < session1.get('intensity', 0):
+                progress_message += f"Symptom '{symptom}' improved from {session1['intensity']} to {session2['intensity']}.\n"
             else:
                 progress_message += f"Symptom '{symptom}' remained the same or worsened.\n"
     return progress_message
 
-# Define the LangChain agent to assess progress using the GAD-7 or PHQ-9
+# LangChain agent to assess progress using the GAD-7 or PHQ-9
 def create_assessment_agent(assessment_type, llm):
     questions = GAD7_QUESTIONS if assessment_type == "GAD-7" else PHQ9_QUESTIONS
     prompt = PromptTemplate(
-        input_variables=["questions", "session"],
-        template="Given the session notes and assessment questions: {questions}, calculate the {assessment_type} score."
+        input_variables=["session", "assessment_type", "questions"],
+        template="Given the session notes: {session}, calculate the {assessment_type} score using the following questions: {questions}."
     )
     chain = LLMChain(llm=llm, prompt=prompt)
     return chain
 
-# Define the LangChain router that selects the appropriate agent based on session content
+# LangChain router that selects the appropriate agent based on session content
 def define_router(llm):
     tools = []
     # Agent for GAD-7
     gad7_agent = create_assessment_agent("GAD-7", llm)
-    tools.append(Tool(name="GAD-7 Assessment", func=gad7_agent.run, description="Useful for assessing anxiety levels."))
+    tools.append(Tool(
+        name="GAD-7 Assessment",
+        func=lambda session: gad7_agent.run(session=session, assessment_type="GAD-7", questions=GAD7_QUESTIONS),
+        description="Useful for assessing anxiety levels."
+    ))
 
     # Agent for PHQ-9
     phq9_agent = create_assessment_agent("PHQ-9", llm)
-    tools.append(Tool(name="PHQ-9 Assessment", func=phq9_agent.run, description="Useful for assessing depression levels."))
+    tools.append(Tool(
+        name="PHQ-9 Assessment",
+        func=lambda session: phq9_agent.run(session=session, assessment_type="PHQ-9", questions=PHQ9_QUESTIONS),
+        description="Useful for assessing depression levels."
+    ))
 
     router = initialize_agent(tools, llm, agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION, verbose=True)
     return router
@@ -96,9 +126,12 @@ def user_interface(llm):
     session_files = st.file_uploader("Upload session notes in JSON format", type=["json"], accept_multiple_files=True)
     sessions = []
     for file in session_files:
-        content = file.read()
-        session = json.loads(content)
-        sessions.append(session)
+        content = file.read().decode("utf-8")
+        try:
+            session = json.loads(content)
+            sessions.append(session)
+        except json.JSONDecodeError:
+            st.warning(f"File {file.name} is not a valid JSON file.")
 
     # List of possible symptoms to track
     symptom_keywords = ["Sleep", "Anxiety", "Depression"]
@@ -112,18 +145,17 @@ def user_interface(llm):
             st.warning("Please upload at least two sessions for progress analysis.")
         else:
             # Extract and analyze symptoms using LLM
-            symptom_data = {}
-            for symptom in symptom_keywords:
-                symptom_data[symptom] = {
-                    'session1': {'present': False, 'intensity': 0},
-                    'session2': {'present': False, 'intensity': 0}
+            symptom_data_session1 = extract_symptoms_with_llm(sessions[0], [selected_symptom], llm)
+            symptom_data_session2 = extract_symptoms_with_llm(sessions[1], [selected_symptom], llm)
+            
+            symptoms_data = {
+                selected_symptom: {
+                    'session1': symptom_data_session1.get(selected_symptom, {'present': False, 'intensity': 0}),
+                    'session2': symptom_data_session2.get(selected_symptom, {'present': False, 'intensity': 0})
                 }
-                # Placeholder for actual intensity extraction
-                # For demonstration, assume intensity decreases over sessions
-                symptom_data[symptom]['session1']['intensity'] = 5
-                symptom_data[symptom]['session2']['intensity'] = 3
-
-            progress = analyze_symptom_progress(symptom_data)
+            }
+            st.write(f"SYMPTOM DATA: {symptoms_data}")
+            progress = analyze_symptom_progress(symptoms_data)
             st.write(f"Progress Analysis: {progress}")
 
             # Select and run assessment agent
@@ -133,12 +165,11 @@ def user_interface(llm):
 
 # Main function to initialize the app
 def main():
-    # Initialize OpenAI LLM
     llm = OllamaLLM(
-        model="llama3.1:8b",
+        model="llama3.1:latest",
         base_url="http://localhost:11434"
     )
-    # llm = OpenAI(temperature=0.7)
+    
     # Start the user interface in Streamlit
     user_interface(llm)
 
