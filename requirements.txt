@@ -1,0 +1,7 @@
+streamlit
+langchain
+langgraph
+duckduckgo-search
+spacy
+langchain_community
+langchain-ollama
