@@ -4,7 +4,6 @@ import re
 from langchain.agents import initialize_agent, Tool, AgentExecutor
 from langchain.agents import AgentType
 from langchain_ollama import OllamaLLM
-from langchain.tools import DuckDuckGoSearchResults
 from langchain.chains import LLMChain
 from langchain.prompts import PromptTemplate
 
@@ -31,43 +30,52 @@ PHQ9_QUESTIONS = [
     "Thoughts that you would be better off dead, or of hurting yourself in some way?"
 ]
 
-# Helper function to score the answers to GAD-7 or PHQ-9
-def calculate_score(responses, questions):
-    score = sum(responses)
-    return score
-
-
 # Function to extract symptoms from the session data using LLM
 def extract_symptoms_with_llm(session, symptom_keywords, llm):
+    symptoms_str = ", ".join(symptom_keywords)
+    
     prompt = PromptTemplate(
         input_variables=["session", "symptoms"],
-        template="Given the session notes: {session}, identify the presence and intensity of the following symptoms: {symptoms}."
+        template=(
+            "Given the session notes: {session}, identify the presence and intensity of the following symptoms: {symptoms}. "
+            "Please provide your answer in JSON format only, without any additional text or explanation. "
+            "Example format: {{'Anxiety': {{'present': True, 'intensity': 7}}, 'Sleep': {{'present': False, 'intensity': 0}}, 'Depression': {{'present': True, 'intensity': 2}}}}"
+        )
     )
+    
     chain = LLMChain(llm=llm, prompt=prompt)
-    response = chain.run(session=session, symptoms=symptom_keywords)
+    response = chain.run(session=session, symptoms=symptoms_str)
     
-    # Initialize symptom data dictionary
-    symptom_data = {}
+    # Initialize symptom_data with default values
+    symptom_data = {symptom: {'present': False, 'intensity': 0} for symptom in symptom_keywords}
     
-    # Iterate through each symptom keyword
-    for symptom in symptom_keywords:
-        # Check if the symptom is mentioned in the response
-        if symptom.lower() in response.lower():
-            symptom_data[symptom] = {'present': True}
-            # Use regex to find intensity value for the symptom
-            pattern = re.compile(rf"{re.escape(symptom)}.*?(\d+)", re.IGNORECASE)
-            match = pattern.search(response)
-            if match:
-                intensity = int(match.group(1))
-            else:
-                # If no number is found, default intensity to 3
-                intensity = 3
-            symptom_data[symptom]['intensity'] = intensity
+    # Attempt to parse the JSON response
+    try:
+        parsed_response = json.loads(response)
+        # Update symptom_data with parsed values
+        for symptom in symptom_keywords:
+            if symptom in parsed_response:
+                symptom_data[symptom]['present'] = parsed_response[symptom]['present']
+                symptom_data[symptom]['intensity'] = parsed_response[symptom]['intensity']
+    except json.JSONDecodeError:
+        # Handle JSON parsing errors
+        pass  # Use default values if parsing fails
+    
+    # Validate and clean the symptom_data
+    for symptom, details in symptom_data.items():
+        if isinstance(details['present'], str):
+            details['present'] = details['present'].lower() == 'true'
+        if 'intensity' in details:
+            try:
+                intensity = int(details['intensity'])
+                details['intensity'] = max(0, min(10, intensity))
+            except ValueError:
+                details['intensity'] = 0
         else:
-            # Symptom not present
-            symptom_data[symptom] = {'present': False, 'intensity': 0}
+            details['intensity'] = 0
     
     return symptom_data
+
 
 # Function to analyze symptom progress
 def analyze_symptom_progress(symptoms_data):
@@ -86,6 +94,11 @@ def analyze_symptom_progress(symptoms_data):
                 progress_message += f"Symptom '{symptom}' remained the same or worsened.\n"
     return progress_message
 
+
+
+
+
+
 # LangChain agent to assess progress using the GAD-7 or PHQ-9
 def create_assessment_agent(assessment_type, llm):
     questions = GAD7_QUESTIONS if assessment_type == "GAD-7" else PHQ9_QUESTIONS
@@ -95,6 +108,11 @@ def create_assessment_agent(assessment_type, llm):
     )
     chain = LLMChain(llm=llm, prompt=prompt)
     return chain
+
+
+
+
+
 
 # LangChain router that selects the appropriate agent based on session content
 def define_router(llm):
@@ -117,6 +135,14 @@ def define_router(llm):
 
     router = initialize_agent(tools, llm, agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION, verbose=True)
     return router
+
+
+
+
+
+
+
+
 
 # Streamlit interface for user input
 def user_interface(llm):
@@ -163,6 +189,11 @@ def user_interface(llm):
             assessment_response = router.run(f"Assess therapy progress for symptom: {selected_symptom}")
             st.write(f"Assessment Result: {assessment_response}")
 
+
+
+
+
+
 # Main function to initialize the app
 def main():
     llm = OllamaLLM(
@@ -172,6 +203,11 @@ def main():
     
     # Start the user interface in Streamlit
     user_interface(llm)
+
+
+
+
+
 
 # Run the application
 if __name__ == "__main__":
