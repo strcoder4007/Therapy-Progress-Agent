@@ -2,12 +2,11 @@ import re
 import json
 import streamlit as st
 from langchain_ollama import OllamaLLM
-from langchain.agents import initialize_agent, Tool, AgentExecutor
-from langchain.agents import AgentType
+from langchain_core.tools import StructuredTool
+from langchain.agents import initialize_agent, AgentType
 from langchain.prompts import PromptTemplate
-from langchain.output_parsers import PydanticOutputParser
 from pydantic import BaseModel, Field
-from typing import Dict, Union
+from typing import Dict, List
 
 # Define Pydantic models for symptom data
 class SymptomDetails(BaseModel):
@@ -18,10 +17,6 @@ class SymptomData(BaseModel):
     Anxiety: SymptomDetails = SymptomDetails()
     Sleep: SymptomDetails = SymptomDetails()
     Depression: SymptomDetails = SymptomDetails()
-
-# Create Pydantic output parser
-parser = PydanticOutputParser(pydantic_object=SymptomData)
-format_instructions = parser.get_format_instructions()
 
 # Sample GAD-7, PHQ-9, and ISI questions for demonstration
 GAD7_QUESTIONS = [
@@ -56,83 +51,57 @@ ISI_QUESTIONS = [
     "How worried or upset do you feel about your sleep?"
 ]
 
-# Function to extract symptoms from the session data using LLM
-def extract_symptoms_with_llm(session, symptom_keywords, llm):
-    symptoms_str = ", ".join(symptom_keywords)
-    
-    prompt = PromptTemplate(
-        input_variables=["session", "symptoms"],
-        template=(
-            "Given the session notes: {session}, identify the presence and intensity of the following symptoms: {symptoms}. "
-            "Please provide your answer in JSON format only, without any additional text or explanation. "
-            "Include all specified symptoms in the JSON response, even if they are not present, with 'present': False and 'intensity': 0. "
-            "Example format: {{\"Anxiety\": {{\"present\": True, \"intensity\": 7}}, \"Sleep\": {{\"present\": False, \"intensity\": 0}}, \"Depression\": {{\"present\": True, \"intensity\": 2}} }} "
-            "Ensure the output is a valid JSON object."
-        )
-    )
-    
-    response = llm(prompt.format(session=session, symptoms=symptoms_str))
-    
-    # Parse the structured output
-    try:
-        parsed_response = parser.parse(response)
-        parsed_response_dict = parsed_response.model_dump()
-    except Exception as e:
-        st.error(f"Error parsing JSON response: {e}")
-        parsed_response_dict = {symptom: {'present': False, 'intensity': 0} for symptom in symptom_keywords}
-    
-    # Validate and clean the symptom_data
-    for symptom in symptom_keywords:
-        if symptom not in parsed_response_dict:
-            parsed_response_dict[symptom] = {'present': False, 'intensity': 0}
-        if isinstance(parsed_response_dict[symptom]['present'], str):
-            parsed_response_dict[symptom]['present'] = parsed_response_dict[symptom]['present'].lower() == 'true'
-        try:
-            parsed_response_dict[symptom]['intensity'] = int(parsed_response_dict[symptom]['intensity'])
-            parsed_response_dict[symptom]['intensity'] = max(0, min(10, parsed_response_dict[symptom]['intensity']))
-        except ValueError:
-            parsed_response_dict[symptom]['intensity'] = 0
-    
-    return parsed_response_dict
+# Define input model for assessment tools
+class AssessmentInput(BaseModel):
+    session: str
+    assessment_type: str
+    questions: List[str]
 
-# Function to analyze symptom progress
-def analyze_symptom_progress(symptoms_data):
+# Function to analyze symptom progress based on assessment scores
+def analyze_symptom_progress(symptom_scores_session1, symptom_scores_session2, selected_symptom):
     progress_message = ""
-    for symptom, details in symptoms_data.items():
-        session1 = details.get('session1', {})
-        session2 = details.get('session2', {})
-        if session1.get('present') and not session2.get('present'):
-            progress_message += f"Symptom '{symptom}' was present in Session 1 but not in Session 2. Possible improvement.\n"
-        elif not session1.get('present') and session2.get('present'):
-            progress_message += f"Symptom '{symptom}' was not mentioned in Session 1 but appeared in Session 2. Possible worsening.\n"
-        elif session1.get('present') and session2.get('present'):
-            if session2.get('intensity', 0) < session1.get('intensity', 0):
-                progress_message += f"Symptom '{symptom}' improved from {session1['intensity']} to {session2['intensity']}.\n"
-            else:
-                progress_message += f"Symptom '{symptom}' remained the same or worsened.\n"
+    symptom = selected_symptom
+    score1 = symptom_scores_session1.get(symptom, 0)
+    score2 = symptom_scores_session2.get(symptom, 0)
+    
+    if score1 > score2:
+        progress_message = f"Symptom '{symptom}' improved from {score1} to {score2}."
+    elif score1 < score2:
+        progress_message = f"Symptom '{symptom}' worsened from {score1} to {score2}."
+    else:
+        progress_message = f"Symptom '{symptom}' remained the same with a score of {score1}."
+    
     return progress_message
 
 # LangChain agent to assess progress using the GAD-7, PHQ-9, or ISI
-def create_assessment_agent(assessment_type, llm):
-    if assessment_type == "GAD-7":
-        questions = GAD7_QUESTIONS
-    elif assessment_type == "PHQ-9":
-        questions = PHQ9_QUESTIONS
-    elif assessment_type == "ISI":
-        questions = ISI_QUESTIONS
-    else:
-        raise ValueError("Unsupported assessment type.")
-    
+def create_assessment_agent(assessment_type: str, llm, questions: List[str]):
     prompt = PromptTemplate(
         input_variables=["session", "assessment_type", "questions"],
         template=(
             "Given the session notes: {session}, calculate the {assessment_type} score using the following questions: {questions}. "
-            "Provide the score as a JSON object including only Anxiety, Sleep, and Depression. "
-            "Ensure the output is a valid JSON object."
+            "Provide the score in JSON format with keys 'Anxiety', 'Sleep', and 'Depression' and their corresponding scores."
         )
     )
     chain = prompt | llm
     return chain
+
+# LangChain router that selects the appropriate agent based on session content
+def define_router(llm, assessment_type: str, questions: List[str]):
+    # Create agent for the selected assessment type
+    assessment_agent = create_assessment_agent(assessment_type, llm, questions)
+
+    tools = [
+        StructuredTool(
+            name=f"{assessment_type} Assessment",
+            func=lambda input: assessment_agent.invoke(input),
+            description=f"Useful for assessing {assessment_type.lower()} levels.",
+            args_schema=AssessmentInput
+        )
+    ]
+    
+    # Initialize the router agent with a compatible agent type
+    router = initialize_agent(tools, llm, agent=AgentType.OPENAI_MULTI_FUNCTIONS, verbose=True, handle_parsing_errors=True)
+    return router
 
 # Streamlit interface for user input
 def user_interface(llm):
@@ -150,7 +119,7 @@ def user_interface(llm):
             st.warning(f"File {file.name} is not a valid JSON file.")
 
     # List of possible symptoms to track
-    symptom_keywords = ["Sleep", "Anxiety", "Depression"]
+    symptom_keywords = ["Anxiety", "Depression", "Sleep"]
 
     # Symptom selection
     selected_symptom = st.selectbox("Select a symptom to track", symptom_keywords)
@@ -160,8 +129,9 @@ def user_interface(llm):
         if len(sessions) < 2:
             st.warning("Please upload at least two sessions for progress analysis.")
         else:
-            with st.spinner('Analyzing progress...'):
-                # Determine which assessment agent to use based on selected symptom
+            # Show a spinner while processing the data
+            with st.spinner("Analyzing progress..."):
+                # Determine assessment type and questions based on selected symptom
                 if selected_symptom == "Anxiety":
                     assessment_type = "GAD-7"
                     questions = GAD7_QUESTIONS
@@ -172,39 +142,41 @@ def user_interface(llm):
                     assessment_type = "ISI"
                     questions = ISI_QUESTIONS
                 else:
-                    st.error("Invalid symptom selected.")
+                    st.warning("Invalid symptom selected.")
                     return
+
+                # Define router for both sessions
+                router = define_router(llm, assessment_type, questions)
+
+                # Prepare input for assessment
+                input_session1 = AssessmentInput(
+                    session=json.dumps(sessions[0]),
+                    assessment_type=assessment_type,
+                    questions=questions
+                )
+                input_session2 = AssessmentInput(
+                    session=json.dumps(sessions[1]),
+                    assessment_type=assessment_type,
+                    questions=questions
+                )
                 
-                # Create the appropriate assessment agent
-                assessment_agent = create_assessment_agent(assessment_type, llm)
+                # Run assessment for session 1
+                assessment_response_session1 = router.invoke(input_session1)
+                # Run assessment for session 2
+                assessment_response_session2 = router.invoke(input_session2)
                 
-                # Assess both sessions
+                # Parse assessment scores
                 try:
-                    assessment_response1 = assessment_agent.invoke({"session": sessions[0], "assessment_type": assessment_type, "questions": questions})
-                    assessment_response2 = assessment_agent.invoke({"session": sessions[1], "assessment_type": assessment_type, "questions": questions})
-                except Exception as e:
-                    st.error(f"Error running assessment agent: {e}")
-                    return
+                    symptom_scores_session1 = json.loads(assessment_response_session1)
+                    symptom_scores_session2 = json.loads(assessment_response_session2)
+                except json.JSONDecodeError:
+                    st.error("Error parsing assessment scores from LLM response.")
+                    symptom_scores_session1 = {symptom: 0 for symptom in symptom_keywords}
+                    symptom_scores_session2 = {symptom: 0 for symptom in symptom_keywords}
                 
-                # Extract the scores from the assessment responses
-                try:
-                    score_session1 = json.loads(assessment_response1)[selected_symptom]['score']
-                    score_session2 = json.loads(assessment_response2)[selected_symptom]['score']
-                except KeyError:
-                    st.error("Error extracting scores from assessment responses.")
-                    return
-                
-                # Analyze progress
-                if score_session2 < score_session1:
-                    st.write(f"Symptom '{selected_symptom}' improved from {score_session1} to {score_session2}.")
-                elif score_session2 > score_session1:
-                    st.write(f"Symptom '{selected_symptom}' worsened from {score_session1} to {score_session2}.")
-                else:
-                    st.write(f"Symptom '{selected_symptom}' remained the same.")
-                
-                # Optionally, display the full assessment responses
-                st.write(f"Assessment for Session 1: {assessment_response1}")
-                st.write(f"Assessment for Session 2: {assessment_response2}")
+                # Analyze the symptom progress
+                progress = analyze_symptom_progress(symptom_scores_session1, symptom_scores_session2, selected_symptom)
+                st.write(f"Progress Analysis: {progress}")
 
 # Main function to initialize the app
 def main():
