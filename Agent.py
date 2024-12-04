@@ -4,8 +4,17 @@ import re
 from langchain.agents import initialize_agent, Tool, AgentExecutor
 from langchain.agents import AgentType
 from langchain_ollama import OllamaLLM
-from langchain.chains import LLMChain
 from langchain.prompts import PromptTemplate
+from langchain.schema.output_parser import OutputParserException
+from langchain.output_parsers import ResponseSchema, StructuredOutputParser
+
+# Define response schema for structured output
+response_schemas = [
+    ResponseSchema(name=symptom, type="object", description="Details about the symptom presence and intensity")
+    for symptom in ["Anxiety", "Sleep", "Depression"]
+]
+output_parser = StructuredOutputParser.from_response_schemas(response_schemas)
+format_instructions = output_parser.get_format_instructions()
 
 # Sample GAD-7 and PHQ-9 questions for demonstration
 GAD7_QUESTIONS = [
@@ -34,48 +43,52 @@ PHQ9_QUESTIONS = [
 def extract_symptoms_with_llm(session, symptom_keywords, llm):
     symptoms_str = ", ".join(symptom_keywords)
     
+    # Generate response schemas based on symptom_keywords
+    local_response_schemas = [
+        ResponseSchema(name=symptom, type="object", description="Details about the symptom presence and intensity")
+        for symptom in symptom_keywords
+    ]
+    local_output_parser = StructuredOutputParser.from_response_schemas(local_response_schemas)
+    local_format_instructions = local_output_parser.get_format_instructions()
+    
     prompt = PromptTemplate(
         input_variables=["session", "symptoms"],
         template=(
             "Given the session notes: {session}, identify the presence and intensity of the following symptoms: {symptoms}. "
             "Please provide your answer in JSON format only, without any additional text or explanation. "
-            "Example format: {{'Anxiety': {{'present': True, 'intensity': 7}}, 'Sleep': {{'present': False, 'intensity': 0}}, 'Depression': {{'present': True, 'intensity': 2}}}}"
-        )
+            "Include only the specified symptoms in the JSON response. "
+            "Example format: {{'Anxiety': {{'present': True, 'intensity': 7}}, 'Sleep': {{'present': False, 'intensity': 0}}, 'Depression': {{'present': True, 'intensity': 2}} }}\n"
+            "{format_instructions}"
+        ),
+        partial_variables={"format_instructions": local_format_instructions}
     )
     
-    chain = LLMChain(llm=llm, prompt=prompt)
-    response = chain.run(session=session, symptoms=symptoms_str)
+    chain = prompt | llm
+    response = chain.invoke({"session": session, "symptoms": symptoms_str})
     
-    # Initialize symptom_data with default values
-    symptom_data = {symptom: {'present': False, 'intensity': 0} for symptom in symptom_keywords}
+    # Log the raw response from the LLM for debugging
+    st.write(f"Raw response from LLM: {response}")
     
-    # Attempt to parse the JSON response
+    # Parse the structured output
     try:
-        parsed_response = json.loads(response)
-        # Update symptom_data with parsed values
-        for symptom in symptom_keywords:
-            if symptom in parsed_response:
-                symptom_data[symptom]['present'] = parsed_response[symptom]['present']
-                symptom_data[symptom]['intensity'] = parsed_response[symptom]['intensity']
-    except json.JSONDecodeError:
-        # Handle JSON parsing errors
-        pass  # Use default values if parsing fails
+        parsed_response = local_output_parser.parse(response)
+    except OutputParserException as e:
+        st.error(f"Error parsing JSON response: {e}")
+        parsed_response = {symptom: {'present': False, 'intensity': 0} for symptom in symptom_keywords}
     
     # Validate and clean the symptom_data
-    for symptom, details in symptom_data.items():
-        if isinstance(details['present'], str):
-            details['present'] = details['present'].lower() == 'true'
-        if 'intensity' in details:
-            try:
-                intensity = int(details['intensity'])
-                details['intensity'] = max(0, min(10, intensity))
-            except ValueError:
-                details['intensity'] = 0
-        else:
-            details['intensity'] = 0
+    for symptom in symptom_keywords:
+        if symptom not in parsed_response:
+            parsed_response[symptom] = {'present': False, 'intensity': 0}
+        if isinstance(parsed_response[symptom]['present'], str):
+            parsed_response[symptom]['present'] = parsed_response[symptom]['present'].lower() == 'true'
+        try:
+            parsed_response[symptom]['intensity'] = int(parsed_response[symptom]['intensity'])
+            parsed_response[symptom]['intensity'] = max(0, min(10, parsed_response[symptom]['intensity']))
+        except ValueError:
+            parsed_response[symptom]['intensity'] = 0
     
-    return symptom_data
-
+    return parsed_response
 
 # Function to analyze symptom progress
 def analyze_symptom_progress(symptoms_data):
@@ -94,25 +107,16 @@ def analyze_symptom_progress(symptoms_data):
                 progress_message += f"Symptom '{symptom}' remained the same or worsened.\n"
     return progress_message
 
-
-
-
-
-
 # LangChain agent to assess progress using the GAD-7 or PHQ-9
 def create_assessment_agent(assessment_type, llm):
     questions = GAD7_QUESTIONS if assessment_type == "GAD-7" else PHQ9_QUESTIONS
     prompt = PromptTemplate(
         input_variables=["session", "assessment_type", "questions"],
-        template="Given the session notes: {session}, calculate the {assessment_type} score using the following questions: {questions}."
+        template="Given the session notes: {session}, calculate the {assessment_type} score using the following questions: {questions}. Provide the score as a JSON object including only Anxiety, Sleep, and Depression.",
+        partial_variables={"format_instructions": format_instructions}
     )
-    chain = LLMChain(llm=llm, prompt=prompt)
+    chain = prompt | llm
     return chain
-
-
-
-
-
 
 # LangChain router that selects the appropriate agent based on session content
 def define_router(llm):
@@ -121,7 +125,7 @@ def define_router(llm):
     gad7_agent = create_assessment_agent("GAD-7", llm)
     tools.append(Tool(
         name="GAD-7 Assessment",
-        func=lambda session: gad7_agent.run(session=session, assessment_type="GAD-7", questions=GAD7_QUESTIONS),
+        func=lambda session: gad7_agent.invoke({"session": session, "assessment_type": "GAD-7", "questions": GAD7_QUESTIONS}),
         description="Useful for assessing anxiety levels."
     ))
 
@@ -129,20 +133,12 @@ def define_router(llm):
     phq9_agent = create_assessment_agent("PHQ-9", llm)
     tools.append(Tool(
         name="PHQ-9 Assessment",
-        func=lambda session: phq9_agent.run(session=session, assessment_type="PHQ-9", questions=PHQ9_QUESTIONS),
+        func=lambda session: phq9_agent.invoke({"session": session, "assessment_type": "PHQ-9", "questions": PHQ9_QUESTIONS}),
         description="Useful for assessing depression levels."
     ))
 
     router = initialize_agent(tools, llm, agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION, verbose=True)
     return router
-
-
-
-
-
-
-
-
 
 # Streamlit interface for user input
 def user_interface(llm):
@@ -186,13 +182,8 @@ def user_interface(llm):
 
             # Select and run assessment agent
             router = define_router(llm)
-            assessment_response = router.run(f"Assess therapy progress for symptom: {selected_symptom}")
+            assessment_response = router.invoke(f"Assess therapy progress for symptom: {selected_symptom}")
             st.write(f"Assessment Result: {assessment_response}")
-
-
-
-
-
 
 # Main function to initialize the app
 def main():
@@ -203,11 +194,6 @@ def main():
     
     # Start the user interface in Streamlit
     user_interface(llm)
-
-
-
-
-
 
 # Run the application
 if __name__ == "__main__":
