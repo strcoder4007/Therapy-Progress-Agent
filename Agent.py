@@ -6,15 +6,23 @@ from langchain.agents import AgentType
 from langchain_ollama import OllamaLLM
 from langchain.prompts import PromptTemplate
 from langchain.schema.output_parser import OutputParserException
-from langchain.output_parsers import ResponseSchema, StructuredOutputParser
+from langchain.output_parsers import PydanticOutputParser
+from pydantic import BaseModel, Field
+from typing import Dict, Union
 
-# Define response schema for structured output
-response_schemas = [
-    ResponseSchema(name=symptom, type="object", description="Details about the symptom presence and intensity")
-    for symptom in ["Anxiety", "Sleep", "Depression"]
-]
-output_parser = StructuredOutputParser.from_response_schemas(response_schemas)
-format_instructions = output_parser.get_format_instructions()
+# Define Pydantic models for symptom data
+class SymptomDetails(BaseModel):
+    present: bool = False
+    intensity: int = 0
+
+class SymptomData(BaseModel):
+    Anxiety: SymptomDetails = SymptomDetails()
+    Sleep: SymptomDetails = SymptomDetails()
+    Depression: SymptomDetails = SymptomDetails()
+
+# Create Pydantic output parser
+parser = PydanticOutputParser(pydantic_object=SymptomData)
+format_instructions = parser.get_format_instructions()
 
 # Sample GAD-7 and PHQ-9 questions for demonstration
 GAD7_QUESTIONS = [
@@ -43,52 +51,42 @@ PHQ9_QUESTIONS = [
 def extract_symptoms_with_llm(session, symptom_keywords, llm):
     symptoms_str = ", ".join(symptom_keywords)
     
-    # Generate response schemas based on symptom_keywords
-    local_response_schemas = [
-        ResponseSchema(name=symptom, type="object", description="Details about the symptom presence and intensity")
-        for symptom in symptom_keywords
-    ]
-    local_output_parser = StructuredOutputParser.from_response_schemas(local_response_schemas)
-    local_format_instructions = local_output_parser.get_format_instructions()
-    
     prompt = PromptTemplate(
         input_variables=["session", "symptoms"],
         template=(
             "Given the session notes: {session}, identify the presence and intensity of the following symptoms: {symptoms}. "
             "Please provide your answer in JSON format only, without any additional text or explanation. "
-            "Include only the specified symptoms in the JSON response. "
-            "Example format: {{'Anxiety': {{'present': True, 'intensity': 7}}, 'Sleep': {{'present': False, 'intensity': 0}}, 'Depression': {{'present': True, 'intensity': 2}} }}\n"
+            "Include all specified symptoms in the JSON response, even if they are not present, with 'present': False and 'intensity': 0. "
+            "Example format: '{{'Anxiety': {{'present': True, 'intensity': 7}}, 'Sleep': {{'present': False, 'intensity': 0}}, 'Depression': {{'present': True, 'intensity': 2}}}}'\n"
             "{format_instructions}"
         ),
-        partial_variables={"format_instructions": local_format_instructions}
+        partial_variables={"format_instructions": format_instructions}
     )
     
     chain = prompt | llm
     response = chain.invoke({"session": session, "symptoms": symptoms_str})
     
-    # Log the raw response from the LLM for debugging
-    st.write(f"Raw response from LLM: {response}")
-    
     # Parse the structured output
     try:
-        parsed_response = local_output_parser.parse(response)
+        parsed_response = parser.parse(response)
+        parsed_response_dict = parsed_response.model_dump()
     except OutputParserException as e:
         st.error(f"Error parsing JSON response: {e}")
-        parsed_response = {symptom: {'present': False, 'intensity': 0} for symptom in symptom_keywords}
+        parsed_response_dict = {symptom: {'present': False, 'intensity': 0} for symptom in symptom_keywords}
     
     # Validate and clean the symptom_data
     for symptom in symptom_keywords:
-        if symptom not in parsed_response:
-            parsed_response[symptom] = {'present': False, 'intensity': 0}
-        if isinstance(parsed_response[symptom]['present'], str):
-            parsed_response[symptom]['present'] = parsed_response[symptom]['present'].lower() == 'true'
+        if symptom not in parsed_response_dict:
+            parsed_response_dict[symptom] = {'present': False, 'intensity': 0}
+        if isinstance(parsed_response_dict[symptom]['present'], str):
+            parsed_response_dict[symptom]['present'] = parsed_response_dict[symptom]['present'].lower() == 'true'
         try:
-            parsed_response[symptom]['intensity'] = int(parsed_response[symptom]['intensity'])
-            parsed_response[symptom]['intensity'] = max(0, min(10, parsed_response[symptom]['intensity']))
+            parsed_response_dict[symptom]['intensity'] = int(parsed_response_dict[symptom]['intensity'])
+            parsed_response_dict[symptom]['intensity'] = max(0, min(10, parsed_response_dict[symptom]['intensity']))
         except ValueError:
-            parsed_response[symptom]['intensity'] = 0
+            parsed_response_dict[symptom]['intensity'] = 0
     
-    return parsed_response
+    return parsed_response_dict
 
 # Function to analyze symptom progress
 def analyze_symptom_progress(symptoms_data):
@@ -167,8 +165,8 @@ def user_interface(llm):
             st.warning("Please upload at least two sessions for progress analysis.")
         else:
             # Extract and analyze symptoms using LLM
-            symptom_data_session1 = extract_symptoms_with_llm(sessions[0], [selected_symptom], llm)
-            symptom_data_session2 = extract_symptoms_with_llm(sessions[1], [selected_symptom], llm)
+            symptom_data_session1 = extract_symptoms_with_llm(sessions[0], symptom_keywords, llm)
+            symptom_data_session2 = extract_symptoms_with_llm(sessions[1], symptom_keywords, llm)
             
             symptoms_data = {
                 selected_symptom: {
