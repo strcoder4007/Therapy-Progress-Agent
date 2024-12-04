@@ -1,7 +1,7 @@
 streamlit
 langchain
 langgraph
-duckduckgo-search
 spacy
 langchain_community
+langchain-google-genai
 langchain-ollama

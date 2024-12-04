@@ -134,6 +134,35 @@ def create_assessment_agent(assessment_type, llm):
     chain = prompt | llm
     return chain
 
+# LangChain router that selects the appropriate agent based on session content
+def define_router(session, llm):
+    # Create separate agents for each assessment
+    gad7_agent = create_assessment_agent("GAD-7", llm)
+    phq9_agent = create_assessment_agent("PHQ-9", llm)
+    isi_agent = create_assessment_agent("ISI", llm)
+
+    tools = [
+        Tool(
+            name="GAD-7 Assessment",
+            func=lambda session: gad7_agent.invoke({"session": session, "assessment_type": "GAD-7", "questions": GAD7_QUESTIONS}),
+            description="Useful for assessing anxiety levels."
+        ),
+        Tool(
+            name="PHQ-9 Assessment",
+            func=lambda session: phq9_agent.invoke({"session": session, "assessment_type": "PHQ-9", "questions": PHQ9_QUESTIONS}),
+            description="Useful for assessing depression levels."
+        ),
+        Tool(
+            name="ISI Assessment",
+            func=lambda session: isi_agent.invoke({"session": session, "assessment_type": "ISI", "questions": ISI_QUESTIONS}),
+            description="Useful for assessing sleep-related issues."
+        )
+    ]
+    
+    # Initialize the router agent with a different agent type
+    router = initialize_agent(tools, llm, agent=AgentType.CHAT_ZERO_SHOT_REACT_DESCRIPTION, verbose=True, handle_parsing_errors=True)
+    return router
+
 # Streamlit interface for user input
 def user_interface(llm):
     st.title("Therapy Progress Tracker")
@@ -160,51 +189,32 @@ def user_interface(llm):
         if len(sessions) < 2:
             st.warning("Please upload at least two sessions for progress analysis.")
         else:
-            with st.spinner('Analyzing progress...'):
-                # Determine which assessment agent to use based on selected symptom
-                if selected_symptom == "Anxiety":
-                    assessment_type = "GAD-7"
-                    questions = GAD7_QUESTIONS
-                elif selected_symptom == "Depression":
-                    assessment_type = "PHQ-9"
-                    questions = PHQ9_QUESTIONS
-                elif selected_symptom == "Sleep":
-                    assessment_type = "ISI"
-                    questions = ISI_QUESTIONS
-                else:
-                    st.error("Invalid symptom selected.")
-                    return
+            # Show a spinner while processing the data
+            with st.spinner("Analyzing progress..."):
+                # Extract and analyze symptoms using LLM
+                symptom_data_session1 = extract_symptoms_with_llm(sessions[0], symptom_keywords, llm)
+                symptom_data_session2 = extract_symptoms_with_llm(sessions[1], symptom_keywords, llm)
                 
-                # Create the appropriate assessment agent
-                assessment_agent = create_assessment_agent(assessment_type, llm)
+                # Prepare the symptom data for analysis
+                symptoms_data = {
+                    selected_symptom: {
+                        'session1': symptom_data_session1.get(selected_symptom, {'present': False, 'intensity': 0}),
+                        'session2': symptom_data_session2.get(selected_symptom, {'present': False, 'intensity': 0})
+                    }
+                }
+                st.write(f"JSON response: {symptoms_data}")
                 
-                # Assess both sessions
+                # Analyze the symptom progress
+                progress = analyze_symptom_progress(symptoms_data)
+                st.write(f"Progress Analysis: {progress}")
+
+                # Select and run the assessment agent
+                router = define_router(sessions, llm)
                 try:
-                    assessment_response1 = assessment_agent.invoke({"session": sessions[0], "assessment_type": assessment_type, "questions": questions})
-                    assessment_response2 = assessment_agent.invoke({"session": sessions[1], "assessment_type": assessment_type, "questions": questions})
+                    assessment_response = router.run(f"Assess therapy progress for symptom: {selected_symptom}")
+                    st.write(f"Assessment Result: {assessment_response}")
                 except Exception as e:
                     st.error(f"Error running assessment agent: {e}")
-                    return
-                
-                # Extract the scores from the assessment responses
-                try:
-                    score_session1 = json.loads(assessment_response1)[selected_symptom]['score']
-                    score_session2 = json.loads(assessment_response2)[selected_symptom]['score']
-                except KeyError:
-                    st.error("Error extracting scores from assessment responses.")
-                    return
-                
-                # Analyze progress
-                if score_session2 < score_session1:
-                    st.write(f"Symptom '{selected_symptom}' improved from {score_session1} to {score_session2}.")
-                elif score_session2 > score_session1:
-                    st.write(f"Symptom '{selected_symptom}' worsened from {score_session1} to {score_session2}.")
-                else:
-                    st.write(f"Symptom '{selected_symptom}' remained the same.")
-                
-                # Optionally, display the full assessment responses
-                st.write(f"Assessment for Session 1: {assessment_response1}")
-                st.write(f"Assessment for Session 2: {assessment_response2}")
 
 # Main function to initialize the app
 def main():
@@ -219,3 +229,4 @@ def main():
 # Run the application
 if __name__ == "__main__":
     main()
+
