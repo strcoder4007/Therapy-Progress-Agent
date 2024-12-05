@@ -3,5 +3,4 @@ langchain
 langgraph
 spacy
 langchain_community
-langchain-google-genai
 langchain-ollama

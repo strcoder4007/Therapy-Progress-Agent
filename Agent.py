@@ -8,7 +8,7 @@ class SymptomDetails:
     def __init__(self, present=False, intensity=0, description=""):
         self.present = present
         self.intensity = intensity
-        self.description = description
+        self.description = description if description else ("found no issues" if intensity == 0 else "")
 
 class SymptomData:
     def __init__(self, Anxiety=None, Sleep=None, Depression=None):
@@ -49,7 +49,6 @@ ISI_QUESTIONS = [
     "How worried or upset do you feel about your sleep?"
 ]
 
-
 # Function to analyze symptom progress
 def analyze_symptom_progress(session1, session2, selected_symptom):
     score1 = getattr(session1, selected_symptom).intensity
@@ -58,11 +57,20 @@ def analyze_symptom_progress(session1, session2, selected_symptom):
     description2 = getattr(session2, selected_symptom).description
     
     if score1 > score2:
-        return f"Symptom '{selected_symptom}' improved from {score1} to {score2}. In session 1, {description1} while in session 2, {description2}"
+        return (
+            f"Symptom '{selected_symptom}' improved from {score1} to {score2}. "
+            f"In session 1, {description1} while in session 2, {description2}"
+        )
     elif score1 < score2:
-        return f"Symptom '{selected_symptom}' worsened from {score1} to {score2}. Description: {description1} {description2}"
+        return (
+            f"Symptom '{selected_symptom}' worsened from {score1} to {score2}. "
+            f"In session 1, {description1} while in session 2, {description2}"
+        )
     else:
-        return f"Symptom '{selected_symptom}' remained the same with a score of {score1}. Description: {description1} {description2}"
+        return (
+            f"Symptom '{selected_symptom}' remained the same with a score of {score1}. "
+            f"In session 1, {description1} also in session 2, {description2}"
+        )
 
 # Streamlit interface
 def user_interface(llm):
@@ -103,7 +111,7 @@ def user_interface(llm):
                     st.warning("Invalid symptom selected.")
                     return
 
-                # Prompt template
+                # Prompt template with an example
                 prompt_template = PromptTemplate(
                     input_variables=["session", "assessment_type", "questions"],
                     template=(
@@ -112,8 +120,9 @@ def user_interface(llm):
                         "Questions: {questions}\n"
                         "Provide the assessment results in the following JSON format, output the JSON and nothing else:\n"
                         "{{'Anxiety': {{'present': bool, 'intensity': int, 'description': str}}, 'Sleep': {{'present': bool, 'intensity': int, 'description': str}}, 'Depression': {{'present': bool, 'intensity': int, 'description': str}}}}\n"
-                        "Ensure that 'intensity' is an integer between 0 and 10 and 'description' is a string with no more than 100 words."
-                        "Very important note: Output this JSON and NOTHING ELSE."
+                        "Example: {{'Anxiety': {{'present': True, 'intensity': 5, 'description': 'Patient reports moderate anxiety.'}} }}\n"
+                        "Ensure that 'intensity' is an integer between 0 and 10 and 'description' is a string with no more than 100 words.\n"
+                        "Very important note: Output only this JSON and NOTHING ELSE."
                     )
                 )
 
@@ -146,15 +155,22 @@ def user_interface(llm):
                     st.write(assessment_response_session2)
                     # Use default values if parsing fails
                     data_session1 = {
-                        "Anxiety": {"present": False, "intensity": 0, "description": ""},
-                        "Sleep": {"present": False, "intensity": 0, "description": ""},
-                        "Depression": {"present": False, "intensity": 0, "description": ""}
+                        "Anxiety": {"present": False, "intensity": 0, "description": "found no issues"},
+                        "Sleep": {"present": False, "intensity": 0, "description": "found no issues"},
+                        "Depression": {"present": False, "intensity": 0, "description": "found no issues"}
                     }
                     data_session2 = {
-                        "Anxiety": {"present": False, "intensity": 0, "description": ""},
-                        "Sleep": {"present": False, "intensity": 0, "description": ""},
-                        "Depression": {"present": False, "intensity": 0, "description": ""}
+                        "Anxiety": {"present": False, "intensity": 0, "description": "found no issues"},
+                        "Sleep": {"present": False, "intensity": 0, "description": "found no issues"},
+                        "Depression": {"present": False, "intensity": 0, "description": "found no issues"}
                     }
+
+                # Ensure 'description' is present and set default if intensity is 0
+                for symptom in ["Anxiety", "Sleep", "Depression"]:
+                    if data_session1[symptom].get("intensity", 0) == 0:
+                        data_session1[symptom]["description"] = data_session1[symptom].get("description", "found no issues")
+                    if data_session2[symptom].get("intensity", 0) == 0:
+                        data_session2[symptom]["description"] = data_session2[symptom].get("description", "found no issues")
 
                 # Create SymptomData instances
                 session1_data = SymptomData(
