@@ -1,22 +1,20 @@
-import re
 import json
 import streamlit as st
 from langchain_ollama import OllamaLLM
-from langchain_core.tools import StructuredTool
-from langchain.agents import initialize_agent, AgentType
 from langchain.prompts import PromptTemplate
-from pydantic import BaseModel, Field
-from typing import Dict, List
 
-# Define Pydantic models for symptom data
-class SymptomDetails(BaseModel):
-    present: bool = False
-    intensity: int = 0
+# Define data models for symptom data
+class SymptomDetails:
+    def __init__(self, present=False, intensity=0, description=""):
+        self.present = present
+        self.intensity = intensity
+        self.description = description
 
-class SymptomData(BaseModel):
-    Anxiety: SymptomDetails = SymptomDetails()
-    Sleep: SymptomDetails = SymptomDetails()
-    Depression: SymptomDetails = SymptomDetails()
+class SymptomData:
+    def __init__(self, Anxiety=None, Sleep=None, Depression=None):
+        self.Anxiety = Anxiety if Anxiety is not None else SymptomDetails()
+        self.Sleep = Sleep if Sleep is not None else SymptomDetails()
+        self.Depression = Depression if Depression is not None else SymptomDetails()
 
 # Sample GAD-7, PHQ-9, and ISI questions for demonstration
 GAD7_QUESTIONS = [
@@ -51,63 +49,26 @@ ISI_QUESTIONS = [
     "How worried or upset do you feel about your sleep?"
 ]
 
-# Define input model for assessment tools
-class AssessmentInput(BaseModel):
-    session: str
-    assessment_type: str
-    questions: List[str]
 
-# Function to analyze symptom progress based on assessment scores
-def analyze_symptom_progress(symptom_scores_session1, symptom_scores_session2, selected_symptom):
-    progress_message = ""
-    symptom = selected_symptom
-    score1 = symptom_scores_session1.get(symptom, 0)
-    score2 = symptom_scores_session2.get(symptom, 0)
+# Function to analyze symptom progress
+def analyze_symptom_progress(session1, session2, selected_symptom):
+    score1 = getattr(session1, selected_symptom).intensity
+    score2 = getattr(session2, selected_symptom).intensity
+    description1 = getattr(session1, selected_symptom).description
+    description2 = getattr(session2, selected_symptom).description
     
     if score1 > score2:
-        progress_message = f"Symptom '{symptom}' improved from {score1} to {score2}."
+        return f"Symptom '{selected_symptom}' improved from {score1} to {score2}. In session 1, {description1} while in session 2, {description2}"
     elif score1 < score2:
-        progress_message = f"Symptom '{symptom}' worsened from {score1} to {score2}."
+        return f"Symptom '{selected_symptom}' worsened from {score1} to {score2}. Description: {description1} {description2}"
     else:
-        progress_message = f"Symptom '{symptom}' remained the same with a score of {score1}."
-    
-    return progress_message
+        return f"Symptom '{selected_symptom}' remained the same with a score of {score1}. Description: {description1} {description2}"
 
-# LangChain agent to assess progress using the GAD-7, PHQ-9, or ISI
-def create_assessment_agent(assessment_type: str, llm, questions: List[str]):
-    prompt = PromptTemplate(
-        input_variables=["session", "assessment_type", "questions"],
-        template=(
-            "Given the session notes: {session}, calculate the {assessment_type} score using the following questions: {questions}. "
-            "Provide the score in JSON format with keys 'Anxiety', 'Sleep', and 'Depression' and their corresponding scores."
-        )
-    )
-    chain = prompt | llm
-    return chain
-
-# LangChain router that selects the appropriate agent based on session content
-def define_router(llm, assessment_type: str, questions: List[str]):
-    # Create agent for the selected assessment type
-    assessment_agent = create_assessment_agent(assessment_type, llm, questions)
-
-    tools = [
-        StructuredTool(
-            name=f"{assessment_type} Assessment",
-            func=lambda input: assessment_agent.invoke(input),
-            description=f"Useful for assessing {assessment_type.lower()} levels.",
-            args_schema=AssessmentInput
-        )
-    ]
-    
-    # Initialize the router agent with a compatible agent type
-    router = initialize_agent(tools, llm, agent=AgentType.OPENAI_MULTI_FUNCTIONS, verbose=True, handle_parsing_errors=True)
-    return router
-
-# Streamlit interface for user input
+# Streamlit interface
 def user_interface(llm):
     st.title("Therapy Progress Tracker")
 
-    # Upload JSON session notes
+    # Upload session notes
     session_files = st.file_uploader("Upload session notes in Text or JSON format", type=["txt", "json"], accept_multiple_files=True)
     sessions = []
     for file in session_files:
@@ -118,20 +79,17 @@ def user_interface(llm):
         except json.JSONDecodeError:
             st.warning(f"File {file.name} is not a valid JSON file.")
 
-    # List of possible symptoms to track
-    symptom_keywords = ["Anxiety", "Depression", "Sleep"]
-
     # Symptom selection
+    symptom_keywords = ["Anxiety", "Depression", "Sleep"]
     selected_symptom = st.selectbox("Select a symptom to track", symptom_keywords)
 
-    # Button to analyze progress
+    # Analyze progress button
     if st.button("Analyze Progress"):
         if len(sessions) < 2:
             st.warning("Please upload at least two sessions for progress analysis.")
         else:
-            # Show a spinner while processing the data
             with st.spinner("Analyzing progress..."):
-                # Determine assessment type and questions based on selected symptom
+                # Determine assessment type and questions
                 if selected_symptom == "Anxiety":
                     assessment_type = "GAD-7"
                     questions = GAD7_QUESTIONS
@@ -145,49 +103,82 @@ def user_interface(llm):
                     st.warning("Invalid symptom selected.")
                     return
 
-                # Define router for both sessions
-                router = define_router(llm, assessment_type, questions)
+                # Prompt template
+                prompt_template = PromptTemplate(
+                    input_variables=["session", "assessment_type", "questions"],
+                    template=(
+                        "Given the session notes, calculate the {assessment_type} score using the questions provided.\n"
+                        "Session notes: {session}\n"
+                        "Questions: {questions}\n"
+                        "Provide the assessment results in the following JSON format, output the JSON and nothing else:\n"
+                        "{{'Anxiety': {{'present': bool, 'intensity': int, 'description': str}}, 'Sleep': {{'present': bool, 'intensity': int, 'description': str}}, 'Depression': {{'present': bool, 'intensity': int, 'description': str}}}}\n"
+                        "Ensure that 'intensity' is an integer between 0 and 10 and 'description' is a string with no more than 100 words."
+                        "Very important note: Output this JSON and NOTHING ELSE."
+                    )
+                )
 
-                # Prepare input for assessment
-                input_session1 = AssessmentInput(
+                # Generate assessment for session 1
+                prompt1 = prompt_template.format(
                     session=json.dumps(sessions[0]),
                     assessment_type=assessment_type,
                     questions=questions
                 )
-                input_session2 = AssessmentInput(
+                response1 = llm.generate([prompt1])
+                assessment_response_session1 = response1.generations[0][0].text.strip()
+
+                # Generate assessment for session 2
+                prompt2 = prompt_template.format(
                     session=json.dumps(sessions[1]),
                     assessment_type=assessment_type,
                     questions=questions
                 )
-                
-                # Run assessment for session 1
-                assessment_response_session1 = router.invoke(input_session1)
-                # Run assessment for session 2
-                assessment_response_session2 = router.invoke(input_session2)
-                
-                # Parse assessment scores
+                response2 = llm.generate([prompt2])
+                assessment_response_session2 = response2.generations[0][0].text.strip()
+
+                # Parse JSON responses
                 try:
-                    symptom_scores_session1 = json.loads(assessment_response_session1)
-                    symptom_scores_session2 = json.loads(assessment_response_session2)
-                except json.JSONDecodeError:
-                    st.error("Error parsing assessment scores from LLM response.")
-                    symptom_scores_session1 = {symptom: 0 for symptom in symptom_keywords}
-                    symptom_scores_session2 = {symptom: 0 for symptom in symptom_keywords}
-                
-                # Analyze the symptom progress
-                progress = analyze_symptom_progress(symptom_scores_session1, symptom_scores_session2, selected_symptom)
+                    data_session1 = json.loads(assessment_response_session1)
+                    data_session2 = json.loads(assessment_response_session2)
+                except json.JSONDecodeError as e:
+                    st.error(f"Invalid JSON format in LLM response: {e}")
+                    st.write(assessment_response_session1)
+                    st.write('#############################')
+                    st.write(assessment_response_session2)
+                    # Use default values if parsing fails
+                    data_session1 = {
+                        "Anxiety": {"present": False, "intensity": 0, "description": ""},
+                        "Sleep": {"present": False, "intensity": 0, "description": ""},
+                        "Depression": {"present": False, "intensity": 0, "description": ""}
+                    }
+                    data_session2 = {
+                        "Anxiety": {"present": False, "intensity": 0, "description": ""},
+                        "Sleep": {"present": False, "intensity": 0, "description": ""},
+                        "Depression": {"present": False, "intensity": 0, "description": ""}
+                    }
+
+                # Create SymptomData instances
+                session1_data = SymptomData(
+                    Anxiety=SymptomDetails(**data_session1.get("Anxiety", {})),
+                    Sleep=SymptomDetails(**data_session1.get("Sleep", {})),
+                    Depression=SymptomDetails(**data_session1.get("Depression", {}))
+                )
+                session2_data = SymptomData(
+                    Anxiety=SymptomDetails(**data_session2.get("Anxiety", {})),
+                    Sleep=SymptomDetails(**data_session2.get("Sleep", {})),
+                    Depression=SymptomDetails(**data_session2.get("Depression", {}))
+                )
+
+                # Analyze progress
+                progress = analyze_symptom_progress(session1_data, session2_data, selected_symptom)
                 st.write(f"Progress Analysis: {progress}")
 
-# Main function to initialize the app
+# Main function
 def main():
     llm = OllamaLLM(
         model="llama3.1:latest",
         base_url="http://localhost:11434"
     )
-    
-    # Start the user interface in Streamlit
     user_interface(llm)
 
-# Run the application
 if __name__ == "__main__":
     main()
